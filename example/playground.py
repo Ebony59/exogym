@@ -62,17 +62,39 @@ def main():
     ## STRATEGY - This is where we define custom logic
 
     from exogym.strategy.diloco import DiLoCoStrategy
+    from exogym.strategy.sparta import SPARTAStrategy
+    from exogym.strategy.sparta_diloco import SPARTADiLoCoStrategy
 
-    strategy = DiLoCoStrategy(
+    # strategy = DiLoCoStrategy(
+    #     optim_spec=OptimSpec(torch.optim.AdamW, lr=0.0004),
+    #     lr_scheduler="lambda_cosine",
+    #     lr_scheduler_kwargs={
+    #         "warmup_steps": 1000,
+    #         "cosine_anneal": True,
+    #     },
+    #     max_norm=1.0,
+    #     H=200,
+    # )
+
+    strategy = SPARTAStrategy(
         optim_spec=OptimSpec(torch.optim.AdamW, lr=0.0004),
+        p_sparta=5e-3,  # paper: 0.0005; default 0.005
         lr_scheduler="lambda_cosine",
-        lr_scheduler_kwargs={
-            "warmup_steps": 1000,
-            "cosine_anneal": True,
-        },
+        lr_scheduler_kwargs={"warmup_steps": 1000, "cosine_anneal": True},
         max_norm=1.0,
-        H=200,
     )
+
+    # strategy = SPARTADiLoCoStrategy(
+    #     inner_optim_spec=OptimSpec(torch.optim.AdamW, lr=0.0004),
+    #     outer_optim_spec=OptimSpec(torch.optim.SGD, lr=0.7, nesterov=True, momentum=0.9),  # DiLoCo default
+    #     p_sparta=5e-4,       # try 0.05%
+    #     sparta_interval=1,   # intended frequency for SPARTA (see note below)
+    #     H=200,               # DiLoCo sync interval
+    #     lr_scheduler="lambda_cosine",
+    #     lr_scheduler_kwargs={"warmup_steps": 1000, "cosine_anneal": True},
+    #     max_norm=1.0,
+    # )
+
 
     # Train it!
     trainer.fit(
@@ -87,7 +109,7 @@ def main():
         val_size=256,
         val_interval=100,
         wandb_project='exo-gym',
-        run_name=f'diloco-{dataset}-{NUM_NODES}nodes'
+        run_name=f'sparta-random-{dataset}-{NUM_NODES}nodes'
     )
 
 

@@ -1,3 +1,6 @@
+import time
+import wandb
+
 import torch.distributed as dist
 from copy import deepcopy
 
@@ -28,14 +31,30 @@ class DiLoCoCommunicator(CommunicationModule):
         self.strategy = None  # Will be set by CommunicateOptimizeStrategy
         self.master_model = None
         self.outer_optimizer = None
+        self.cum_bytes = 0
     
     def communicate(self, model, rank: int, num_nodes: int, local_step: int) -> None:
         """Perform master-worker communication."""
         if num_nodes > 1 and local_step % self.H == 0 and local_step > 0:
+            bytes_this_sync = 0
+            
             # First average all models
             for param in model.parameters():
+                payload = param.numel() * param.element_size()
+                bytes_this_sync += payload
                 all_reduce(param.data, op=dist.ReduceOp.SUM)
                 param.data /= num_nodes
+
+            self.cum_bytes += bytes_this_sync
+
+            if rank == 0:
+                n = num_nodes
+                ring_bytes = (2.0 * (n-1)/n) * bytes_this_sync
+                wandb.log({
+                    "payload_bytes": bytes_this_sync,
+                    "ring_bytes_est": ring_bytes,
+                    "cum_payload_bytes": self.cum_bytes,
+                }, step=local_step)
 
             # Master does outer optimization step
             if rank == 0 and self.master_model is not None:
