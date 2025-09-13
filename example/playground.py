@@ -36,6 +36,7 @@ def main():
     )
 
     device = get_device()
+    print("DEVICE:", device)
 
     # Create model
     if dataset == "shakespeare":
@@ -85,8 +86,8 @@ def main():
         shuffle=False,
         val_size=256,
         val_interval=100,
-        # wandb_project='exo-gym',
-        # run_name=f'diloco-{dataset}-{NUM_NODES}nodes'
+        wandb_project='exo-gym',
+        run_name=f'diloco-{dataset}-{NUM_NODES}nodes'
     )
 
 
