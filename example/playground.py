@@ -109,7 +109,7 @@ def main():
         val_size=256,
         val_interval=100,
         wandb_project='exo-gym',
-        run_name=f'sparta-partitioned-{dataset}-{NUM_NODES}nodes'
+        run_name=f'sparta-adam-{dataset}-{NUM_NODES}nodes'
     )
 
 

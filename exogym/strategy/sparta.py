@@ -92,6 +92,8 @@ class SparseCommunicator(CommunicationModule):
             }, step=local_step)
 
             opt = self._get_optimizer()
+            if opt is not None and getattr(self.index_selector, "_optimizer", None) is None:
+                self.index_selector._optimizer = opt
             rms_mean = rms_p95 = drift_mean = drift_p95 = None
             sample_count = 0
 
@@ -165,7 +167,7 @@ class SPARTAStrategy(CommunicateOptimizeStrategy):
     ):
 
         # Create index selector and sparse communicator
-        index_selector = PartitionedIndexSelector(p_sparta, enable_shadow_logging=True)
+        index_selector = AdamSecondMomentSelector(p_sparta, enable_shadow_logging=True)
         sparse_comm = SparseCommunicator(index_selector)
 
         super().__init__(
@@ -338,12 +340,13 @@ class PartitionedIndexSelector(IndexSelector):
 
 
 class AdamSecondMomentSelector(IndexSelector):
-    def __init__(self, p, beta2=0.999, eps=1e-12, use_sqrt=True, enable_shadow_logging: bool = False):
-        super.__init__(p, enable_shadow_logging)
+    def __init__(self, p, alpha=0.5, eps=1e-12, p_floor=1e-6, p_ceil=0.2, enable_shadow_logging: bool = False):
+        super().__init__(p, enable_shadow_logging=enable_shadow_logging)
         self._shadow = {}
-        self.beta2 = beta2
-        self.eps = eos
-        self.use_sqrt = use_sqrt
+        self.alpha = alpha
+        self.eps = eps
+        self.p_floor = p_floor
+        self.p_ceil = p_ceil
 
     @torch.no_grad()
     def get_indices(self, param, iteration):
@@ -351,29 +354,25 @@ class AdamSecondMomentSelector(IndexSelector):
         if n == 0:
             return torch.zeros_like(param, dtype=torch.bool)
 
+        opt = getattr(self, "_optimizer", None)
+        st = (opt.state.get(param, None) if opt is not None else None)
+        v = (st.get("exp_avg_sq", None) if st is not None else None)
+        if v is None:
+            return torch.bernoulli(
+                torch.full(param.shape, self.p, device=param.device)
+            ).bool()
+
+        # importance scores: RMS^alpha (alpha in (0,1] flattens peaky distributions)
+        w = (v.detach().view(-1).sqrt() + self.eps).pow(self.alpha)
+
+        # scale to expected k = ceil(p * n)
         k = max(1, int(self.p * n))
-        g = param.grad
-        #random selection if no grad
-        if g is None:
-            scores = torch.rand(n, device=param.device)
-            topk = torch.topk(scores, k, largest=True).indices
-            mask = torch.zeros(n, dtype=torch.bool, device=param.device)
-            mask[topk] = True
-            return mask.view_as(param)
+        s = (k / (w.sum() + self.eps)).item()
+        p_i = (s * w).clamp_(self.p_floor, self.p_ceil)
 
-        key = param.data_ptr()
-        v = self.state.get(key)
-        g2 = (g.detach().view(-1) ** 2)
-        if v is None or v.shape != g2.shape:
-            v = g2.clone()
-        else:
-            v.mul_(self.beta2).add_(g2, alpha=(1.0 - self.beta2))
+        # Bernoulli draws
+        mask = torch.bernoulli(p_i).bool().view_as(param)
 
-        self.state[key] = v
-        scores = torch.sqrt(v + self.eps) if self.use_sqrt else (v + self.eps)
-        topk = torch.topk(scores, k, largest=True).indices
-        mask = torch.zeros(n, dtype=torch.book, device=param.device)
-        mask[topk] = True
-        return mask.view_as(param)
-        
+        self.ensure_shadow(param)
+        return mask
             
