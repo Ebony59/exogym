@@ -165,7 +165,7 @@ class SPARTAStrategy(CommunicateOptimizeStrategy):
     ):
 
         # Create index selector and sparse communicator
-        index_selector = RandomIndexSelector(p_sparta, enable_shadow_logging=True)
+        index_selector = PartitionedIndexSelector(p_sparta, enable_shadow_logging=True)
         sparse_comm = SparseCommunicator(index_selector)
 
         super().__init__(
@@ -228,9 +228,10 @@ class RandomIndexSelector(IndexSelector):
 
 
 class ShuffledSequentialIndexSelector(IndexSelector):
-    def __init__(self, p):
+    def __init__(self, p, enable_shadow_logging: bool = False):
         # No model-dependent init here
-        super().__init__(p)
+        super().__init__(p, enable_shadow_logging)
+        self._shadow = {}
         # Remove self.shuffled_state and self.index
 
     # Update signature to match base class
@@ -279,8 +280,9 @@ class ShuffledSequentialIndexSelector(IndexSelector):
 
 
 class PartitionedIndexSelector(IndexSelector):
-    def __init__(self, p):
-        super().__init__(p)
+    def __init__(self, p, enable_shadow_logging: bool = False):
+        super().__init__(p, enable_shadow_logging)
+        self._shadow = {}
         # Note: This class implicitly uses a step counter per parameter via self.state[param]["curr_partition"]
         # It doesn't need the global iteration number passed in.
         # To be consistent, we should update its signature, but the iteration argument would be unused.
@@ -333,3 +335,45 @@ class PartitionedIndexSelector(IndexSelector):
         param_state["curr_partition"] += 1
 
         return indices_mask
+
+
+class AdamSecondMomentSelector(IndexSelector):
+    def __init__(self, p, beta2=0.999, eps=1e-12, use_sqrt=True, enable_shadow_logging: bool = False):
+        super.__init__(p, enable_shadow_logging)
+        self._shadow = {}
+        self.beta2 = beta2
+        self.eps = eos
+        self.use_sqrt = use_sqrt
+
+    @torch.no_grad()
+    def get_indices(self, param, iteration):
+        n = param.numel()
+        if n == 0:
+            return torch.zeros_like(param, dtype=torch.bool)
+
+        k = max(1, int(self.p * n))
+        g = param.grad
+        #random selection if no grad
+        if g is None:
+            scores = torch.rand(n, device=param.device)
+            topk = torch.topk(scores, k, largest=True).indices
+            mask = torch.zeros(n, dtype=torch.bool, device=param.device)
+            mask[topk] = True
+            return mask.view_as(param)
+
+        key = param.data_ptr()
+        v = self.state.get(key)
+        g2 = (g.detach().view(-1) ** 2)
+        if v is None or v.shape != g2.shape:
+            v = g2.clone()
+        else:
+            v.mul_(self.beta2).add_(g2, alpha=(1.0 - self.beta2))
+
+        self.state[key] = v
+        scores = torch.sqrt(v + self.eps) if self.use_sqrt else (v + self.eps)
+        topk = torch.topk(scores, k, largest=True).indices
+        mask = torch.zeros(n, dtype=torch.book, device=param.device)
+        mask[topk] = True
+        return mask.view_as(param)
+        
+            
