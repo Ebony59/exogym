@@ -147,7 +147,6 @@ class SPARTAStrategy(Strategy):
 
         index_selector = AdamSecondMomentSelector(
             p_sparta,
-            alpha=1,
             mix_uniform=0,
             warmup_steps=int(MAX_STEPS * WARMUP_RATIO),
             enable_shadow_logging=True
@@ -366,7 +365,7 @@ def main():
         val_size=256,
         val_interval=100,
         wandb_project="exo-sparta",
-        run_name=f"sparta-adam-rotate-alpha1",
+        run_name=f"sparta-adam-rotate-refactor",
     )
 
 
