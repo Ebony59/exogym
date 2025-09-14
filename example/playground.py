@@ -135,7 +135,7 @@ class SPARTAStrategy(Strategy):
         **kwargs,
     ):
 
-        index_selector = RandomIndexSelector(p_sparta)
+        index_selector = RandomIndexSelector(p_sparta, enable_shadow_logging=True)
 
         super().__init__(**kwargs)
         
@@ -144,6 +144,8 @@ class SPARTAStrategy(Strategy):
         self._cum_bytes = 0
 
     def step(self, ):
+        current_step = self.local_step
+        
         t0 = time.perf_counter()
         total_selected = 0
         total_numel = 0
@@ -162,13 +164,13 @@ class SPARTAStrategy(Strategy):
 
                 broadcast(indices_mask, src=0)
 
-                sel = int(mask.sum().item())
+                sel = int(indices_mask.sum().item())
                 if sel == 0:
                     continue
 
                 total_selected += sel
-                total_numel += p.numel()
-                bytes_this_step += sel * p.element_size()
+                total_numel += param.numel()
+                bytes_this_step += sel * param.element_size()
                 
                 sparse_data = param.data[indices_mask]
                 
@@ -178,7 +180,7 @@ class SPARTAStrategy(Strategy):
                 param.masked_scatter_(indices_mask, sparse_data)
                 self.index_selector.post_apply(
                     param=param,
-                    iteration=self.iteration,
+                    iteration=self.local_step,
                     optimizer=self.optim,
                     mask=indices_mask,
                     reduced_values=sparse_data,
@@ -191,65 +193,65 @@ class SPARTAStrategy(Strategy):
         self._cum_bytes += bytes_this_step
         if getattr(self, "rank", 0) == 0:
             eff_p = (total_selected / total_numel) if total_numel else 0.0
-            n = num_nodes
+            n = self.num_nodes
             ring_bytes = (2.0 * (n-1)/n) * bytes_this_step
             wandb.log({
                 "selected_frac": eff_p,
                 "payload_bytes": bytes_this_step,
                 "ring_bytes_est": ring_bytes,
-                "cum_payload_bytes": self.cum_bytes,
+                "cum_payload_bytes": self._cum_bytes,
                 "step_time_ms": (time.perf_counter() - t0) * 1e3
-            }, step=local_step)
+            }, step=current_step)
 
-        rms_mean = rms_p95 = drift_mean = drift_p95 = None
-        sample_count = 0
-        opt = getattr(self, "optim", None)
-
-        for name, p in model.named_parameters():
-            if not p.requires_grad:
-                continue
-            if p.numel() == 0:
-                continue
-
-            # Adam second moment (RMS)
-            rms_layer = None
-            if opt is not None and p in opt.state and "exp_avg_sq" in opt.state[p]:
-                v = opt.state[p]["exp_avg_sq"].detach().view(-1)
-                k = min(4096, v.numel())
-                idx = torch.randint(0, v.numel(), (k,), device=v.device)
-                rms_vals = (v[idx].sqrt()).float()
-                rms_layer = rms_vals
-
-            # Drift
-            drift_layer = None
-            shadow = self.index_selector.get_shadow_vector(p)
-            if torch.is_tensor(shadow) and shadow.shape[0] == p.data.numel():
-                theta = p.data.view(-1)
-                k = min(4096, theta.numel())
-                idx = torch.randint(0, theta.numel(), (k,), device=theta.device)
-                drift_layer = (theta[idx] - shadow[idx]).abs().float()
-
-            if rms_layer is not None:
-                m, p95 = robust_stats(rms_layer)
-                rms_mean = (m if rms_mean is None else (rms_mean + m))
-                rms_p95 = (p95 if rms_p95 is None else (rms_p95 + p95))
-            if drift_layer is not None:
-                m, p95 = robust_stats(drift_layer)
-                drift_mean = (m if drift_mean is None else (drift_mean + m))
-                drift_p95  = (p95 if drift_p95 is None else (drift_p95 + p95))
-
-            sample_count += 1
+            rms_mean = rms_p95 = drift_mean = drift_p95 = None
+            sample_count = 0
+            opt = getattr(self, "optim", None)
+    
+            for name, p in self.model.named_parameters():
+                if not p.requires_grad:
+                    continue
+                if p.numel() == 0:
+                    continue
+    
+                # Adam second moment (RMS)
+                rms_layer = None
+                if opt is not None and p in opt.state and "exp_avg_sq" in opt.state[p]:
+                    v = opt.state[p]["exp_avg_sq"].detach().view(-1)
+                    k = min(4096, v.numel())
+                    idx = torch.randint(0, v.numel(), (k,), device=v.device)
+                    rms_vals = (v[idx].sqrt()).float()
+                    rms_layer = rms_vals
+    
+                # Drift
+                drift_layer = None
+                shadow = self.index_selector.get_shadow_vector(p)
+                if torch.is_tensor(shadow) and shadow.shape[0] == p.data.numel():
+                    theta = p.data.view(-1)
+                    k = min(4096, theta.numel())
+                    idx = torch.randint(0, theta.numel(), (k,), device=theta.device)
+                    drift_layer = (theta[idx] - shadow[idx]).abs().float()
+    
+                if rms_layer is not None:
+                    m, p95 = robust_stats(rms_layer)
+                    rms_mean = (m if rms_mean is None else (rms_mean + m))
+                    rms_p95 = (p95 if rms_p95 is None else (rms_p95 + p95))
+                if drift_layer is not None:
+                    m, p95 = robust_stats(drift_layer)
+                    drift_mean = (m if drift_mean is None else (drift_mean + m))
+                    drift_p95  = (p95 if drift_p95 is None else (drift_p95 + p95))
+    
+                sample_count += 1
             
-        if sample_count > 0:
-            def avg_or_none(x):
-                return (x / sample_count) if isinstance(x, (int,float)) else (x / sample_count if x is not None else None)
-
-            wandb.log({
-                "rms_grad_mean": avg_or_none(rms_mean),
-                "rms_grad_p95":  avg_or_none(rms_p95),
-                "drift_mean":    avg_or_none(drift_mean),
-                "drift_p95":     avg_or_none(drift_p95),
-            }, step=local_step)
+            if sample_count > 0:
+                def avg_or_none(x):
+                    return (x / sample_count) if isinstance(x, (int,float)) else (x / sample_count if x is not None else None)
+    
+                wandb.log({
+                    "rms_grad_mean": avg_or_none(rms_mean),
+                    "rms_grad_p95":  avg_or_none(rms_p95),
+                    "drift_mean":    avg_or_none(drift_mean),
+                    "drift_p95":     avg_or_none(drift_p95),
+                }, step=current_step)
         
         
 def main():
@@ -290,17 +292,7 @@ def main():
     ## STRATEGY - This is where we define custom logic
 
     # to default back to data parallel training:
-    strategy = SimpleReduceStrategy(
-        optim_spec=OptimSpec(torch.optim.AdamW, lr=0.0004),
-        lr_scheduler="lambda_cosine",
-        lr_scheduler_kwargs={
-            "warmup_steps": 1000,
-            "cosine_anneal": True,
-        },
-        max_norm=1.0,
-    )
-
-    # strategy = SPARTAStrategy(
+    # strategy = SimpleReduceStrategy(
     #     optim_spec=OptimSpec(torch.optim.AdamW, lr=0.0004),
     #     lr_scheduler="lambda_cosine",
     #     lr_scheduler_kwargs={
@@ -308,8 +300,18 @@ def main():
     #         "cosine_anneal": True,
     #     },
     #     max_norm=1.0,
-    #     p=0.005,
     # )
+
+    strategy = SPARTAStrategy(
+        optim_spec=OptimSpec(torch.optim.AdamW, lr=0.0004),
+        lr_scheduler="lambda_cosine",
+        lr_scheduler_kwargs={
+            "warmup_steps": 1000,
+            "cosine_anneal": True,
+        },
+        max_norm=1.0,
+        p=0.005,
+    )
 
     # Train it!
     trainer.fit(
@@ -323,8 +325,8 @@ def main():
         shuffle=False,
         val_size=256,
         val_interval=100,
-        wandb_project='exo-sparta',
-        run_name=f'parallel'
+        wandb_project="exo-sparta",
+        run_name="sparta",
     )
 
 
