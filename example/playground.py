@@ -188,6 +188,31 @@ class GradientSelector(ImportanceSelector):
         return g.add(ETA).pow(self.alpha)
 
 
+class LOTaylorSelector(ImportanceSelector):
+    def __init__(self, p, alpha=1.0, **kwargs):
+        super().__init__(p, **kwargs)
+        self.alpha = alpha
+
+    @torch.no_grad()
+    def compute_scores(self, param, iteration):
+        if param.grad is None:
+            return None
+        theta = param.data.view(-1).float()
+        g = param.grad.view(-1).float()
+        scores = (theta.abs() * g.abs()).add(EPS).pow(self.alpha)
+        return scores
+
+
+class WeightMagnitudeSelector(ImportanceSelector):
+    def __init__(self, p, alpha=1.0, **kwargs):
+        super().__init__(p, **kwargs)
+        self.alpha = alpha
+
+    @torch.no_grad()
+    def compute_scores(self, param, iteration):
+        return param.data.view(-1).abs().float().add(EPS).pow(self.alpha)
+
+
 class EnsembleSelector(ImportanceSelector):
     def __init__(
         self,
@@ -278,10 +303,8 @@ class SPARTAStrategy(Strategy):
         selectors = [adam_sel, drift_sel]
         fracs = [0.5, 0.5]
 
-        index_selector = EnsembleSelector(
+        index_selector = LOTaylorSelector(
             p_sparta,
-            selectors,
-            fracs,
             mix_uniform=0,
             warmup_steps=int(MAX_STEPS * WARMUP_RATIO),
             enable_shadow_logging=True
@@ -503,7 +526,7 @@ def main():
         val_size=256,
         val_interval=100,
         wandb_project="exo-sparta",
-        run_name=f"sparta-adamdrift-adam0.5",
+        run_name=f"sparta-lotaylor",
     )
 
 
