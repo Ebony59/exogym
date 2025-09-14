@@ -15,6 +15,9 @@ from exogym.aux.utils import get_device
 from nanogpt import GPT, GPTConfig, get_dataset
 
 NUM_NODES = 4
+MAX_STEPS = 5000
+
+WARMUP_RATIO = 0
 
 ### PLAYGROUND
 ### This is a minimal configuration for training a nanogpt model with a given strategy.
@@ -70,7 +73,6 @@ class IndexSelector:
     # Add iteration argument to the base class signature
     def get_indices(self, param, iteration):
         # Default implementation returns all indices (mask of Trues)
-        self.ensure_shadow(param)
         return torch.ones_like(param, dtype=torch.bool)
 
     @torch.no_grad()
@@ -100,6 +102,7 @@ class AdamSecondMomentSelector(IndexSelector):
             p_floor=1e-6,
             p_ceil=0.2,
             mix_uniform=0.1,
+            warmup_steps: int = 1000,
             enable_shadow_logging: bool = False
         ):
         super().__init__(p, enable_shadow_logging=enable_shadow_logging)
@@ -109,6 +112,7 @@ class AdamSecondMomentSelector(IndexSelector):
         self.p_floor = p_floor
         self.p_ceil = p_ceil
         self.mix_uniform = 0.1
+        self.warmup_steps = warmup_steps
 
     @torch.no_grad()
     def get_indices(self, param, iteration):
@@ -119,8 +123,7 @@ class AdamSecondMomentSelector(IndexSelector):
         opt = getattr(self, "_optimizer", None)
         st = (opt.state.get(param, None) if opt is not None else None)
         v = (st.get("exp_avg_sq", None) if st is not None else None)
-        if v is None:
-            self.ensure_shadow(param)
+        if iteration < self.warmup_steps or v is None:
             return torch.bernoulli(
                 torch.full(param.shape, self.p, device=param.device)
             ).bool()
@@ -139,7 +142,6 @@ class AdamSecondMomentSelector(IndexSelector):
         # Bernoulli draws
         mask = torch.bernoulli(p_final).bool().view_as(param)
 
-        self.ensure_shadow(param)
         return mask
 
 
@@ -153,7 +155,8 @@ class SPARTAStrategy(Strategy):
 
         index_selector = AdamSecondMomentSelector(
             p_sparta,
-            mix_uniform=0.1,
+            mix_uniform=0,
+            warmup_steps=int(MAX_STEPS * WARMUP_RATIO),
             enable_shadow_logging=True
         )
 
@@ -181,11 +184,14 @@ class SPARTAStrategy(Strategy):
 
                 self.index_selector.ensure_shadow(param)
 
-                indices_mask = self.index_selector.get_indices(
-                    param, self.local_step
-                )
+                # rotate the leader across the nodes
+                leader = self.local_step % self.num_nodes
+                if self.rank == leader:
+                    indices_mask = self.index_selector.get_indices(param, self.local_step)
+                else:
+                    indices_mask = torch.zeros_like(param, dtype=torch.bool)
 
-                broadcast(indices_mask, src=0)
+                broadcast(indices_mask, src=leader)
 
                 sel = int(indices_mask.sum().item())
                 if sel == 0:
@@ -275,8 +281,8 @@ class SPARTAStrategy(Strategy):
                     "drift_mean":    avg_or_none(drift_mean),
                     "drift_p95":     avg_or_none(drift_p95),
                 }, step=current_step)
-        
-        
+
+
 def main():
     arg_parser = argparse.ArgumentParser()
     arg_parser.add_argument("--dataset", type=str, default="owt")
@@ -339,7 +345,7 @@ def main():
     # Train it!
     trainer.fit(
         num_epochs=1,
-        max_steps=5000,
+        max_steps=MAX_STEPS,
         strategy=strategy,
         num_nodes=NUM_NODES,
         device=device,
@@ -349,7 +355,7 @@ def main():
         val_size=256,
         val_interval=100,
         wandb_project="exo-sparta",
-        run_name="sparta-adam-mix0.1",
+        run_name=f"sparta-adam-rotate",
     )
 
 
