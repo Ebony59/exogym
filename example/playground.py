@@ -177,7 +177,7 @@ class AdamDriftSelector(ImportanceSelector):
         assert adam_frac <= 1, "adam_frac should lie within [0,1]"
 
         self.adam_sel = AdamSecondMomentSelector(p, alpha=alpha, **kwargs)
-        self.beta_sel = DriftSelector(p, alpha=alpha, **kwargs)
+        self.drift_sel = DriftSelector(p, beta=beta, **kwargs)
         self.adam_frac = adam_frac
         self.mode = mode
 
@@ -213,7 +213,7 @@ class SPARTAStrategy(Strategy):
         **kwargs,
     ):
 
-        index_selector = AdamSecondMomentSelector(
+        index_selector = AdamDriftSelector(
             p_sparta,
             mix_uniform=0,
             warmup_steps=int(MAX_STEPS * WARMUP_RATIO),
@@ -433,7 +433,7 @@ def main():
         val_size=256,
         val_interval=100,
         wandb_project="exo-sparta",
-        run_name=f"sparta-adam-rotate-refactor",
+        run_name=f"sparta-hybrid",
     )
 
 
