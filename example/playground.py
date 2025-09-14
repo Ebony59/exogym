@@ -23,14 +23,6 @@ WARMUP_RATIO = 0
 ### This is a minimal configuration for training a nanogpt model with a given strategy.
 ### The strategy can be swapped out for custom logic by writing a new strategy class.
 
-def robust_stats(x: torch.Tensor):
-    if x is None or x.numel() == 0:
-        return (None, None)
-    mean = x.mean().item()
-    k = max(1, int(0.95 * x.numel()))
-    p95 = x.float().kthvalue(k).values.item()
-    return (mean, p95)
-
 
 # class IndexSelector:
 #     def __init__(self, p):
@@ -155,6 +147,7 @@ class SPARTAStrategy(Strategy):
 
         index_selector = AdamSecondMomentSelector(
             p_sparta,
+            alpha=1,
             mix_uniform=0,
             warmup_steps=int(MAX_STEPS * WARMUP_RATIO),
             enable_shadow_logging=True
@@ -167,122 +160,140 @@ class SPARTAStrategy(Strategy):
         self._cum_bytes = 0
 
     def step(self, ):
+        if getattr(self.index_selector, "_optimizer", None) is None and hasattr(self, "optim"):
+            self.index_selector.set_optimizer(self.optim)
         current_step = self.local_step
         
         t0 = time.perf_counter()
-        total_selected = 0
-        total_numel = 0
-        bytes_this_step = 0
+        total_selected, total_numel, bytes_this_step = 0, 0, 0
 
-        if getattr(self.index_selector, "_optimizer", None) is None and hasattr(self, "optim"):
-            self.index_selector.set_optimizer(self.optim)
+        # rotate the leader across the nodes
+        leader = self.local_step % self.num_nodes
         
         with torch.no_grad():
             for param in self.model.parameters():
-                if not param.requires_grad or param.grad is None:
+                if not param.requires_grad:
                     continue
 
-                self.index_selector.ensure_shadow(param)
-
-                # rotate the leader across the nodes
-                leader = self.local_step % self.num_nodes
-                if self.rank == leader:
-                    indices_mask = self.index_selector.get_indices(param, self.local_step)
-                else:
-                    indices_mask = torch.zeros_like(param, dtype=torch.bool)
-
-                broadcast(indices_mask, src=leader)
-
-                sel = int(indices_mask.sum().item())
-                if sel == 0:
-                    continue
+                sel, numel, payload = self._communicate_param(param, leader)
 
                 total_selected += sel
                 total_numel += param.numel()
                 bytes_this_step += sel * param.element_size()
                 
-                sparse_data = param.data[indices_mask]
-                
-                all_reduce(sparse_data, op=torch.distributed.ReduceOp.SUM)
-                sparse_data /= self.num_nodes
-
-                param.masked_scatter_(indices_mask, sparse_data)
-                self.index_selector.post_apply(
-                    param=param,
-                    iteration=self.local_step,
-                    optimizer=self.optim,
-                    mask=indices_mask,
-                    reduced_values=sparse_data,
-                )
-
         self.optim.step()
         super().step()
 
         # logging at rank 0
         self._cum_bytes += bytes_this_step
         if getattr(self, "rank", 0) == 0:
-            eff_p = (total_selected / total_numel) if total_numel else 0.0
-            n = self.num_nodes
-            ring_bytes = (2.0 * (n-1)/n) * bytes_this_step
+            self._log_comm(bytes_this_step, total_selected, total_numel, t0, current_step)
+            self._log_optimizer_stats(current_step)
+
+    def _communicate_param(self, param, leader):
+        self.index_selector.ensure_shadow(param)
+
+        if self.rank == leader:
+            indices_mask = self.index_selector.get_indices(param, self.local_step)
+        else:
+            indices_mask = torch.zeros_like(param, dtype=torch.bool)
+
+        broadcast(indices_mask, src=leader)
+
+        sel = int(indices_mask.sum().item())
+        if sel == 0:
+            return 0, param.numel(), 0
+
+        sparse_data = param.data[indices_mask]
+                
+        all_reduce(sparse_data, op=torch.distributed.ReduceOp.SUM)
+        sparse_data /= self.num_nodes
+
+        param.masked_scatter_(indices_mask, sparse_data)
+        self.index_selector.post_apply(
+            param=param,
+            iteration=self.local_step,
+            optimizer=self.optim,
+            mask=indices_mask,
+            reduced_values=sparse_data,
+        )
+
+        return sel, param.numel(), sel * param.element_size()
+
+    def _log_comm(self, bytes_this_step, total_selected, total_numel, t0, step):
+        eff_p = (total_selected / total_numel) if total_numel else 0.0
+        n = self.num_nodes
+        ring_bytes = (2.0 * (n-1)/n) * bytes_this_step
+        wandb.log({
+            "selected_frac": eff_p,
+            "payload_bytes": bytes_this_step,
+            "ring_bytes_est": ring_bytes,
+            "cum_payload_bytes": self._cum_bytes,
+            "step_time_ms": (time.perf_counter() - t0) * 1e3
+        }, step=step)
+
+    def _log_optimizer_stats(self, step):
+        opt = getattr(self, "optim", None)
+        if opt is None:
+            return
+
+        rms_vals, drift_vals = [], []
+        
+        for name, p in self.model.named_parameters():
+            if not p.requires_grad or p.numel() == 0:
+                continue
+            rms_layer, drift_layer = self._collect_layer_stats(p, opt)
+            if rms_layer is not None:
+                rms_vals.append(rms_layer)
+            if drift_layer is not None:
+                drift_vals.append(drift_layer)
+
+            rms_mean, rms_p95 = self._agg(rms_vals)
+            drift_mean, drift_p95 = self._agg(drift_vals)
+
             wandb.log({
-                "selected_frac": eff_p,
-                "payload_bytes": bytes_this_step,
-                "ring_bytes_est": ring_bytes,
-                "cum_payload_bytes": self._cum_bytes,
-                "step_time_ms": (time.perf_counter() - t0) * 1e3
-            }, step=current_step)
+                "rms_grad_mean": rms_mean,
+                "rms_grad_p95": rms_p95,
+                "drift_mean": drift_mean,
+                "drift_p95": drift_p95,
+            }, step=step)
 
-            rms_mean = rms_p95 = drift_mean = drift_p95 = None
-            sample_count = 0
-            opt = getattr(self, "optim", None)
-    
-            for name, p in self.model.named_parameters():
-                if not p.requires_grad:
-                    continue
-                if p.numel() == 0:
-                    continue
-    
-                # Adam second moment (RMS)
-                rms_layer = None
-                if opt is not None and p in opt.state and "exp_avg_sq" in opt.state[p]:
-                    v = opt.state[p]["exp_avg_sq"].detach().view(-1)
-                    k = min(4096, v.numel())
-                    idx = torch.randint(0, v.numel(), (k,), device=v.device)
-                    rms_vals = (v[idx].sqrt()).float()
-                    rms_layer = rms_vals
-    
-                # Drift
-                drift_layer = None
-                shadow = self.index_selector.get_shadow_vector(p)
-                if torch.is_tensor(shadow) and shadow.shape[0] == p.data.numel():
-                    theta = p.data.view(-1)
-                    k = min(4096, theta.numel())
-                    idx = torch.randint(0, theta.numel(), (k,), device=theta.device)
-                    drift_layer = (theta[idx] - shadow[idx]).abs().float()
-    
-                if rms_layer is not None:
-                    m, p95 = robust_stats(rms_layer)
-                    rms_mean = (m if rms_mean is None else (rms_mean + m))
-                    rms_p95 = (p95 if rms_p95 is None else (rms_p95 + p95))
-                if drift_layer is not None:
-                    m, p95 = robust_stats(drift_layer)
-                    drift_mean = (m if drift_mean is None else (drift_mean + m))
-                    drift_p95  = (p95 if drift_p95 is None else (drift_p95 + p95))
-    
-                sample_count += 1
-            
-            if sample_count > 0:
-                def avg_or_none(x):
-                    return (x / sample_count) if isinstance(x, (int,float)) else (x / sample_count if x is not None else None)
-    
-                wandb.log({
-                    "rms_grad_mean": avg_or_none(rms_mean),
-                    "rms_grad_p95":  avg_or_none(rms_p95),
-                    "drift_mean":    avg_or_none(drift_mean),
-                    "drift_p95":     avg_or_none(drift_p95),
-                }, step=current_step)
+    def _collect_layer_stats(self, p, opt):
+        # Adam second momentum (RMS)
+        rms_layer = None
+        if p in opt.state and "exp_avg_sq" in opt.state[p]:
+            v = opt.state[p]["exp_avg_sq"].detach().view(-1)
+            k = min(4096, v.numel())
+            idx = torch.randint(0, v.numel(), (k,), device=v.device)
+            rms_layer = (v[idx].sqrt()).float()
 
+        # Drift
+        drift_layer = None
+        shadow = self.index_selector.get_shadow_vector(p)
+        if torch.is_tensor(shadow) and shadow.shape[0] == p.data.numel():
+            theta = p.data.view(-1)
+            k = min(4096, theta.numel())
+            idx = torch.randint(0, theta.numel(), (k,), device=theta.device)
+            drift_layer = (theta[idx] - shadow[idx]).abs().float()
 
+        return rms_layer, drift_layer
+
+    def _agg(self, x):
+        if not x:
+            return (None, None)
+        cat = torch.cat(x)
+        return self.robust_stats(cat)
+
+    @staticmethod
+    def robust_stats(x: torch.Tensor):
+        if x is None or x.numel() == 0:
+            return (None, None)
+        mean = x.mean().item()
+        k = max(1, int(0.95 * x.numel()))
+        p95 = x.float().kthvalue(k).values.item()
+        return (mean, p95)
+
+    
 def main():
     arg_parser = argparse.ArgumentParser()
     arg_parser.add_argument("--dataset", type=str, default="owt")
@@ -355,7 +366,7 @@ def main():
         val_size=256,
         val_interval=100,
         wandb_project="exo-sparta",
-        run_name=f"sparta-adam-rotate",
+        run_name=f"sparta-adam-rotate-alpha1",
     )
 
 
