@@ -44,6 +44,10 @@ class IndexSelector:
         self.p = p
         self.enable_shadow_logging = enable_shadow_logging
         self._shadow = {}
+        self._optimizer = None  # <-- add
+
+    def set_optimizer(self, optim):
+        self._optimizer = optim
 
     @torch.no_grad()
     def ensure_shadow(self, param):
@@ -52,8 +56,7 @@ class IndexSelector:
         key = id(param)
         flat = param.data.view(-1)
         sh = self._shadow.get(key, None)
-        if (
-            sh is None
+        if (sh is None
             or sh.numel() != flat.numel()
             or sh.device != flat.device
             or sh.dtype != flat.dtype
@@ -90,13 +93,22 @@ class RandomIndexSelector(IndexSelector):
 
 
 class AdamSecondMomentSelector(IndexSelector):
-    def __init__(self, p, alpha=0.5, eps=1e-12, p_floor=1e-6, p_ceil=0.2, enable_shadow_logging: bool = False):
+    def __init__(self,
+            p,
+            alpha=0.5,
+            eps=1e-12,
+            p_floor=1e-6,
+            p_ceil=0.2,
+            mix_uniform=0.1,
+            enable_shadow_logging: bool = False
+        ):
         super().__init__(p, enable_shadow_logging=enable_shadow_logging)
         self._shadow = {}
         self.alpha = alpha
         self.eps = eps
         self.p_floor = p_floor
         self.p_ceil = p_ceil
+        self.mix_uniform = 0.1
 
     @torch.no_grad()
     def get_indices(self, param, iteration):
@@ -108,6 +120,7 @@ class AdamSecondMomentSelector(IndexSelector):
         st = (opt.state.get(param, None) if opt is not None else None)
         v = (st.get("exp_avg_sq", None) if st is not None else None)
         if v is None:
+            self.ensure_shadow(param)
             return torch.bernoulli(
                 torch.full(param.shape, self.p, device=param.device)
             ).bool()
@@ -117,11 +130,14 @@ class AdamSecondMomentSelector(IndexSelector):
 
         # scale to expected k = ceil(p * n)
         k = max(1, int(self.p * n))
-        s = (k / (w.sum() + self.eps)).item()
-        p_i = (s * w).clamp_(self.p_floor, self.p_ceil)
+        scale_factor = (k / (w.sum() + self.eps)).item()
+        p_adam = (scale_factor * w).clamp_(self.p_floor, self.p_ceil)
+
+        p_uni = (float(k) / n)
+        p_final = (1.0 - self.mix_uniform) * p_adam + self.mix_uniform * p_uni
 
         # Bernoulli draws
-        mask = torch.bernoulli(p_i).bool().view_as(param)
+        mask = torch.bernoulli(p_final).bool().view_as(param)
 
         self.ensure_shadow(param)
         return mask
@@ -135,7 +151,11 @@ class SPARTAStrategy(Strategy):
         **kwargs,
     ):
 
-        index_selector = RandomIndexSelector(p_sparta, enable_shadow_logging=True)
+        index_selector = AdamSecondMomentSelector(
+            p_sparta,
+            mix_uniform=0.1,
+            enable_shadow_logging=True
+        )
 
         super().__init__(**kwargs)
         
@@ -150,6 +170,9 @@ class SPARTAStrategy(Strategy):
         total_selected = 0
         total_numel = 0
         bytes_this_step = 0
+
+        if getattr(self.index_selector, "_optimizer", None) is None and hasattr(self, "optim"):
+            self.index_selector.set_optimizer(self.optim)
         
         with torch.no_grad():
             for param in self.model.parameters():
@@ -326,7 +349,7 @@ def main():
         val_size=256,
         val_interval=100,
         wandb_project="exo-sparta",
-        run_name="sparta",
+        run_name="sparta-adam-mix0.1",
     )
 
 
