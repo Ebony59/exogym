@@ -1,5 +1,5 @@
 from abc import abstractmethod
-from typing import Optional
+from typing import Optional, List
 import time
 import wandb
 import torch
@@ -208,6 +208,8 @@ class EnsembleSelector(ImportanceSelector):
         self.fracs = [f/s for f in self.fracs]
 
         for sel in self.selectors:
+            if hasattr(sel, "_shadow"):
+                sel._shadow = self._shadow
             sel.enable_shadow_logging = self.enable_shadow_logging
 
     def set_optimizer(self, optim):
@@ -216,35 +218,33 @@ class EnsembleSelector(ImportanceSelector):
             if hasattr(sel, "set_optimizer"):
                 sel.set_optimizer(optim)
 
-    @torch.no_grad()
-    def ensure_shadow(self, param):
-        sh = super().ensure_shadow(param)
-        for sel in self.selectors:
-            if hasattr(self, '_shadow'):
-                sel._shadow = self._shadow
-        return sh
+    # @torch.no_grad()
+    # def ensure_shadow(self, param):
+    #     sh = super().ensure_shadow(param)
+    #     for sel in self.selectors:
+    #         if hasattr(self, '_shadow'):
+    #             sel._shadow = self._shadow
+    #     return sh
 
-    @torch.no_grad()
-    def post_apply(self, *, param, iteration, optimizer=None, mask=None, reduced_values=None):
-        super().post_apply(param=param, iteration=iteration, optimizer=optimizer, mask=mask, reduced_values=reduced_values)
-        for sel in self.selectors:
-            if hasattr(sel, "post_apply"):
-                self.postapply(param=param, iteration=iteration, optimizer=optimizer, mask=mask, reduced_values=reduced_values)
+    # @torch.no_grad()
+    # def post_apply(self, *, param, iteration, optimizer=None, mask=None, reduced_values=None):
+    #     super().post_apply(param=param, iteration=iteration, optimizer=optimizer, mask=mask, reduced_values=reduced_values)
+    #     for sel in self.selectors:
+    #         if hasattr(sel, "post_apply"):
+    #             sel.post_apply(param=param, iteration=iteration, optimizer=optimizer, mask=mask, reduced_values=reduced_values)
 
     @torch.no_grad()
     def compute_scores(self, param, iteration):
-        avail = []
+        scores = []
+        weights = []
         for frac, sel in zip(self.fracs, self.selectors):
             s = sel.compute_scores(param, iteration)
             if s is not None:
-                avail.append((frac, s))
+                scores.append(s)
+                weights.append(frac)
 
-        if not avail:
+        if not scores:
             return None
-
-        wsum = sum(f for f, _ in avail)
-        weights = [f/wsum for f, _ in avail] if wsum > 0 else [1.0/len(avail)] * len(avail)
-        scores = [s for _, s in avail]
 
         if self.mode == 'sum':
             out = torch.zeros_like(scores[0])
@@ -315,13 +315,13 @@ class SPARTAStrategy(Strategy):
         p_sparta=0.005,
         **kwargs,
     ):
-
-        adam_sel = AdamSecondMomentSelector(p_spartam, **kwargs)
-        drift_sel = DriftSelector(p_spartam, **kwargs)
+        adam_sel = AdamSecondMomentSelector(p_sparta)
+        drift_sel = DriftSelector(p_sparta)
         selectors = [adam_sel, drift_sel]
         fracs = [0.6, 0.4]
 
-        index_selector = AdamDriftSelector(
+        index_selector = EnsembleSelector(
+            p_sparta,
             selectors,
             fracs,
             mix_uniform=0.1,
