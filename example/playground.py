@@ -98,7 +98,7 @@ class ImportanceSelector(IndexSelector):
     ):
         super().__init__(p, enable_shadow_logging=enable_shadow_logging)
         self.warmup_steps = warmup_steps
-        self.mix_uniform = 0.1
+        self.mix_uniform = mix_uniform
         self.p_floor = p_floor
         self.p_ceil = p_ceil
 
@@ -158,7 +158,8 @@ class DriftSelector(ImportanceSelector):
         if shadow is None or shadow.numel() != param.numel():
             return None
         theta = param.data.view(-1)
-        return (theta - shadow).abs().add(EPS).pow(self.beta)
+        scores = (theta - shadow).abs().add(EPS).pow(self.beta)
+        return scores
 
 
 class AdamDriftSelector(ImportanceSelector):
@@ -166,7 +167,7 @@ class AdamDriftSelector(ImportanceSelector):
         self,
         p,
         alpha=0.5,
-        beta=1.0,
+        beta=1,
         adam_frac=0.5,
         mode="sum",
         **kwargs
@@ -213,7 +214,7 @@ class SPARTAStrategy(Strategy):
         **kwargs,
     ):
 
-        index_selector = AdamDriftSelector(
+        index_selector = DriftSelector(
             p_sparta,
             mix_uniform=0,
             warmup_steps=int(MAX_STEPS * WARMUP_RATIO),
@@ -227,6 +228,9 @@ class SPARTAStrategy(Strategy):
         self._cum_bytes = 0
 
     def step(self, ):
+        if self.local_step == 0 and self.rank == 0:
+            print(f"[Selector init] mix_uniform={self.index_selector.mix_uniform} warmup_steps={self.index_selector.warmup_steps}")
+            
         if getattr(self.index_selector, "_optimizer", None) is None and hasattr(self, "optim"):
             self.index_selector.set_optimizer(self.optim)
         current_step = self.local_step
@@ -433,7 +437,7 @@ def main():
         val_size=256,
         val_interval=100,
         wandb_project="exo-sparta",
-        run_name=f"sparta-hybrid",
+        run_name=f"sparta-drift",
     )
 
 
