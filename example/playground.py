@@ -16,6 +16,7 @@ from nanogpt import GPT, GPTConfig, get_dataset
 
 NUM_NODES = 4
 MAX_STEPS = 5000
+EPS = 1e-12
 
 WARMUP_RATIO = 0
 
@@ -39,7 +40,7 @@ class IndexSelector:
         self.p = p
         self.enable_shadow_logging = enable_shadow_logging
         self._shadow = {}
-        self._optimizer = None  # <-- add
+        self._optimizer = None
 
     def set_optimizer(self, optim):
         self._optimizer = optim
@@ -62,10 +63,9 @@ class IndexSelector:
     def get_shadow_vector(self, param):
         return self._shadow.get(id(param), None)
     
-    # Add iteration argument to the base class signature
+    @abstractmethod
     def get_indices(self, param, iteration):
-        # Default implementation returns all indices (mask of Trues)
-        return torch.ones_like(param, dtype=torch.bool)
+        ...
 
     @torch.no_grad()
     def post_apply(self, *, param, iteration, optimizer=None, mask=None, reduced_values=None):
@@ -86,25 +86,25 @@ class RandomIndexSelector(IndexSelector):
         ).bool()
 
 
-class AdamSecondMomentSelector(IndexSelector):
-    def __init__(self,
-            p,
-            alpha=0.5,
-            eps=1e-12,
-            p_floor=1e-6,
-            p_ceil=0.2,
-            mix_uniform=0.1,
-            warmup_steps: int = 1000,
-            enable_shadow_logging: bool = False
-        ):
+class ImportanceSelector(IndexSelector):
+    def __init__(
+        self,
+        p,
+        warmup_steps: int = 1000,
+        mix_uniform=0.1,
+        p_floor=1e-6,
+        p_ceil=0.2,
+        enable_shadow_logging: bool = False
+    ):
         super().__init__(p, enable_shadow_logging=enable_shadow_logging)
-        self._shadow = {}
-        self.alpha = alpha
-        self.eps = eps
+        self.warmup_steps = warmup_steps
+        self.mix_uniform = 0.1
         self.p_floor = p_floor
         self.p_ceil = p_ceil
-        self.mix_uniform = 0.1
-        self.warmup_steps = warmup_steps
+
+    @abstractmethod
+    def compute_scores(self, param, iteration):
+        ...
 
     @torch.no_grad()
     def get_indices(self, param, iteration):
@@ -112,29 +112,97 @@ class AdamSecondMomentSelector(IndexSelector):
         if n == 0:
             return torch.zeros_like(param, dtype=torch.bool)
 
-        opt = getattr(self, "_optimizer", None)
-        st = (opt.state.get(param, None) if opt is not None else None)
-        v = (st.get("exp_avg_sq", None) if st is not None else None)
-        if iteration < self.warmup_steps or v is None:
+        scores = self.compute_scores(param, iteration)
+        if iteration < self.warmup_steps or scores is None:
             return torch.bernoulli(
                 torch.full(param.shape, self.p, device=param.device)
             ).bool()
 
-        # importance scores: RMS^alpha (alpha in (0,1] flattens peaky distributions)
-        w = (v.detach().view(-1).sqrt() + self.eps).pow(self.alpha)
-
-        # scale to expected k = ceil(p * n)
         k = max(1, int(self.p * n))
-        scale_factor = (k / (w.sum() + self.eps)).item()
-        p_adam = (scale_factor * w).clamp_(self.p_floor, self.p_ceil)
+        scale = (k / (scores.sum() + EPS)).item()
+        probs = (scale * scores).clamp_(self.p_floor, self.p_ceil)
 
-        p_uni = (float(k) / n)
-        p_final = (1.0 - self.mix_uniform) * p_adam + self.mix_uniform * p_uni
+        if self.mix_uniform > 0:
+            p_uni = float(k) / n
+            probs = (1 - self.mix_uniform) * probs + self.mix_uniform * p_uni
+        
+        return torch.bernoulli(probs).bool().view_as(param)
 
-        # Bernoulli draws
-        mask = torch.bernoulli(p_final).bool().view_as(param)
 
-        return mask
+class AdamSecondMomentSelector(ImportanceSelector):
+    def __init__(self, p, alpha=0.5, **kwargs):
+        super().__init__(p, **kwargs)
+        self.alpha = alpha
+
+    @torch.no_grad()
+    def compute_scores(self, param, iteration):
+        opt = getattr(self, "_optimizer", None)
+        st = (opt.state.get(param, None) if opt is not None else None)
+        v = (st.get("exp_avg_sq", None) if st is not None else None)
+        if v is None:
+            return None
+
+        # importance scores: RMS^alpha (alpha in (0,1] flattens peaky distributions)
+        w = (v.detach().view(-1).sqrt() + EPS).pow(self.alpha)
+
+        return w
+
+
+class DriftSelector(ImportanceSelector):
+    def __init__(self, p, beta=1.0, **kwargs):
+        super().__init__(p, **kwargs)
+        self.beta = beta
+
+    def compute_scores(self, param, iteration):
+        shadow = self.get_shadow_vector(param)
+        if shadow is None or shadow.numel() != param.numel():
+            return None
+        theta = param.data.view(-1)
+        return (theta - shadow).abs().add(EPS).pow(self.beta)
+
+
+class AdamDriftSelector(ImportanceSelector):
+    def __init__(
+        self,
+        p,
+        alpha=0.5,
+        beta=1.0,
+        adam_frac=0.5,
+        mode="sum",
+        **kwargs
+    ):
+        super().__init__(p, **kwargs)
+
+        assert adam_frac >= 0, "adam_frac should lie within [0,1]"
+        assert adam_frac <= 1, "adam_frac should lie within [0,1]"
+
+        self.adam_sel = AdamSecondMomentSelector(p, alpha=alpha, **kwargs)
+        self.beta_sel = DriftSelector(p, alpha=alpha, **kwargs)
+        self.adam_frac = adam_frac
+        self.mode = mode
+
+    def compute_scores(self, param, iteration):
+        scores_adam = self.adam_sel.compute_scores(param, iteration)
+        scores_drift = self.drift_sel.compute_scores(param, iteration)
+
+        if scores_adam is None and scores_drift is None:
+            return None
+        elif scores_adam is None:
+            return scores_drift
+        elif scores_drift is None:
+            return scores_adam
+
+        if self.mode == "sum":
+            return self.adam_frac * scores_adam + (1.0 - self.adam_frac) * scores_drift
+        elif self.mode == "mul":
+            return scores_adam * scores_drift
+        elif self.mode == "mix":
+            if torch.rand(1).item() < self.adam_frac:
+                return scores_adam
+            else:
+                return scores_drift
+        else:
+            raise ValueError(f"Unknown HybridSelector mode: {self.mode}")
 
 
 class SPARTAStrategy(Strategy):
@@ -177,8 +245,8 @@ class SPARTAStrategy(Strategy):
                 sel, numel, payload = self._communicate_param(param, leader)
 
                 total_selected += sel
-                total_numel += param.numel()
-                bytes_this_step += sel * param.element_size()
+                total_numel += numel
+                bytes_this_step += payload
                 
         self.optim.step()
         super().step()
@@ -247,15 +315,15 @@ class SPARTAStrategy(Strategy):
             if drift_layer is not None:
                 drift_vals.append(drift_layer)
 
-            rms_mean, rms_p95 = self._agg(rms_vals)
-            drift_mean, drift_p95 = self._agg(drift_vals)
+        rms_mean, rms_p95 = self._agg(rms_vals)
+        drift_mean, drift_p95 = self._agg(drift_vals)
 
-            wandb.log({
-                "rms_grad_mean": rms_mean,
-                "rms_grad_p95": rms_p95,
-                "drift_mean": drift_mean,
-                "drift_p95": drift_p95,
-            }, step=step)
+        wandb.log({
+            "rms_grad_mean": rms_mean,
+            "rms_grad_p95": rms_p95,
+            "drift_mean": drift_mean,
+            "drift_p95": drift_p95,
+        }, step=step)
 
     def _collect_layer_stats(self, p, opt):
         # Adam second momentum (RMS)
