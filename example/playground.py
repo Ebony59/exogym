@@ -18,7 +18,7 @@ NUM_NODES = 4
 MAX_STEPS = 5000
 EPS = 1e-12
 
-WARMUP_RATIO = 0
+WARMUP_RATIO = 0.05
 
 ### PLAYGROUND
 ### This is a minimal configuration for training a nanogpt model with a given strategy.
@@ -162,6 +162,108 @@ class DriftSelector(ImportanceSelector):
         return scores
 
 
+class GradientSelector(ImportanceSelector):
+    def __init__(self, p, alpha=0.1, ema: float | None = None, **kwargs):
+        super().__init__(p, **kwargs)
+        self.alpha = alpha
+        self.ema = ema
+        self._ema = {}
+
+    @torch.no_grad()
+    def compute_scores(self, param, iteration):
+        if param.grad is None:
+            return None
+        g = param.grad.view(-1).abs().float()
+
+        if self.ema is not None:
+            key = id(param)
+            buf = self._ema.get(key)
+            if buf is None or buf.numel() != g.numel() or buf.device != g.device:
+                buf = g.clone()
+            else:
+                buf.mul_(self.ema).add_(g, alpha=1 - self.ema)
+            self._ema[key] = buf
+            g = buf
+
+        return g.add(ETA).pow(self.alpha)
+
+
+class EnsembleSelector(ImportanceSelector):
+    def __init__(
+        self,
+        p,
+        selectors: List[ImportanceSelector],
+        fracs: List[float],
+        mode: str = 'sum',
+        **kwargs
+    ):
+        super().__init__(p, **kwargs)
+        assert len(selectors) >= 1, "Need at least one selector"
+        assert len(selectors) == len(fracs), "selectors and fracs must have same length"
+        self.selectors = selectors
+        self.fracs = [float(x) for x in fracs]
+        self.mode = mode
+
+        s = sum(max(f, 0.0) for f in self.fracs)
+        self.fracs = [f/s for f in self.fracs]
+
+        for sel in self.selectors:
+            sel.enable_shadow_logging = self.enable_shadow_logging
+
+    def set_optimizer(self, optim):
+        super().set_optimizer(optim)
+        for sel in self.selectors:
+            if hasattr(sel, "set_optimizer"):
+                sel.set_optimizer(optim)
+
+    @torch.no_grad()
+    def ensure_shadow(self, param):
+        sh = super().ensure_shadow(param)
+        for sel in self.selectors:
+            if hasattr(self, '_shadow'):
+                sel._shadow = self._shadow
+        return sh
+
+    @torch.no_grad()
+    def post_apply(self, *, param, iteration, optimizer=None, mask=None, reduced_values=None):
+        super().post_apply(param=param, iteration=iteration, optimizer=optimizer, mask=mask, reduced_values=reduced_values)
+        for sel in self.selectors:
+            if hasattr(sel, "post_apply"):
+                self.postapply(param=param, iteration=iteration, optimizer=optimizer, mask=mask, reduced_values=reduced_values)
+
+    @torch.no_grad()
+    def compute_scores(self, param, iteration):
+        avail = []
+        for frac, sel in zip(self.fracs, self.selectors):
+            s = sel.compute_scores(param, iteration)
+            if s is not None:
+                avail.append((frac, s))
+
+        if not avail:
+            return None
+
+        wsum = sum(f for f, _ in avail)
+        weights = [f/wsum for f, _ in avail] if wsum > 0 else [1.0/len(avail)] * len(avail)
+        scores = [s for _, s in avail]
+
+        if self.mode == 'sum':
+            out = torch.zeros_like(scores[0])
+            for w, s in zip(weights, scores):
+                out.add_(s, alpha=w)
+            return out
+        elif self.mode == 'mul':
+            acc = torch.zeros_like(scores[0])
+            for w, s in zip(weights, scores):
+                acc.add_(w*torch.log(s))
+            return torch.exp(acc)
+        elif self.mode == 'mix':
+            probs = torch.tensor(weights, device=scores[0].device, dtype=torch.float32)
+            idx = torch.multinomial(probs, 1).item()
+            return scores[idx]
+        else:
+            raise ValueError(f"Unknown EnsembleSelector mode: {self.mode}")
+
+
 class AdamDriftSelector(ImportanceSelector):
     def __init__(
         self,
@@ -214,9 +316,15 @@ class SPARTAStrategy(Strategy):
         **kwargs,
     ):
 
-        index_selector = DriftSelector(
-            p_sparta,
-            mix_uniform=0,
+        adam_sel = AdamSecondMomentSelector(p_spartam, **kwargs)
+        drift_sel = DriftSelector(p_spartam, **kwargs)
+        selectors = [adam_sel, drift_sel]
+        fracs = [0.6, 0.4]
+
+        index_selector = AdamDriftSelector(
+            selectors,
+            fracs,
+            mix_uniform=0.1,
             warmup_steps=int(MAX_STEPS * WARMUP_RATIO),
             enable_shadow_logging=True
         )
@@ -437,7 +545,7 @@ def main():
         val_size=256,
         val_interval=100,
         wandb_project="exo-sparta",
-        run_name=f"sparta-drift",
+        run_name=f"sparta-ensemble-adam0.6-mix0.1-warmup0.05",
     )
 
 
