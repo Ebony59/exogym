@@ -18,7 +18,7 @@ NUM_NODES = 4
 MAX_STEPS = 5000
 EPS = 1e-12
 
-WARMUP_RATIO = 0
+WARMUP_RATIO = 0.05
 
 ### PLAYGROUND
 ### This is a minimal configuration for training a nanogpt model with a given strategy.
@@ -300,12 +300,15 @@ class SPARTAStrategy(Strategy):
     ):
         adam_sel = AdamSecondMomentSelector(p_sparta)
         drift_sel = DriftSelector(p_sparta)
-        selectors = [adam_sel, drift_sel]
-        fracs = [0.5, 0.5]
+        lotaylor_sel = LOTaylorSelector(p_sparta)
+        selectors = [adam_sel, drift_sel, lotaylor_sel]
+        fracs = [0.4, 0.2, 0.4]
 
-        index_selector = LOTaylorSelector(
+        index_selector = EnsembleSelector(
             p_sparta,
-            mix_uniform=0,
+            selectors,
+            fracs,
+            mix_uniform=0.1,
             warmup_steps=int(MAX_STEPS * WARMUP_RATIO),
             enable_shadow_logging=True
         )
@@ -526,7 +529,7 @@ def main():
         val_size=256,
         val_interval=100,
         wandb_project="exo-sparta",
-        run_name=f"sparta-lotaylor",
+        run_name=f"sparta-adam0.4drift0.2taylor0.4-mix0.1-warmup0.05",
     )
 
 
